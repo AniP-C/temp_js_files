@@ -1,0 +1,497 @@
+import { exec } from "child_process";
+import cors from "cors";
+import dotenv from "dotenv";
+import voice from "elevenlabs-node";
+import express from "express";
+import { promises as fs } from "fs";
+import axios from "axios";
+import http from "http";
+import path from "path";
+
+dotenv.config();
+
+// Ollama configuration - Force IPv4 to avoid IPv6 connection issues
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemma2:2b"; // Using lighter model for faster response
+
+console.log("=== Configuration ===");
+console.log(`Ollama URL: ${OLLAMA_BASE_URL}`);
+console.log(`Ollama Model: ${OLLAMA_MODEL}`);
+
+const elevenLabsApiKey = process.env.ELEVEN_LABS_API_KEY;
+const voiceID = process.env.ELEVEN_LABS_VOICE_ID || "pFZP5JQG7iQjIQuC4Bku"; // Make voice ID configurable
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+const port = process.env.PORT || 3000;
+
+// Ensure directories exist
+const ensureDirectories = async () => {
+  try {
+    await fs.mkdir('audios', { recursive: true });
+    await fs.mkdir('bin', { recursive: true });
+    console.log("✅ Directories created/verified");
+  } catch (error) {
+    console.error("❌ Error creating directories:", error);
+  }
+};
+
+// Validate ElevenLabs API Key
+const validateElevenLabsKey = async () => {
+  if (!elevenLabsApiKey) {
+    console.log("⚠️  ElevenLabs API key not set in environment variables");
+    return false;
+  }
+
+  try {
+    console.log("🔑 Validating ElevenLabs API key...");
+    const response = await axios.get("https://api.elevenlabs.io/v1/user", {
+      headers: {
+        'xi-api-key': elevenLabsApiKey
+      },
+      timeout: 10000
+    });
+    
+    console.log("✅ ElevenLabs API key is valid");
+    console.log(`User: ${response.data.subscription?.tier || 'Free'} plan`);
+    return true;
+  } catch (error) {
+    console.error("❌ ElevenLabs API key validation failed:", error.response?.status, error.response?.data?.detail || error.message);
+    return false;
+  }
+};
+
+// Check if FFmpeg is available
+const checkFFmpeg = async () => {
+  try {
+    await execCommand("ffmpeg -version");
+    console.log("✅ FFmpeg is available");
+    return true;
+  } catch (error) {
+    console.log("❌ FFmpeg not found. Please install FFmpeg:");
+    console.log("   Windows: Download from https://ffmpeg.org/download.html and add to PATH");
+    console.log("   Mac: brew install ffmpeg");
+    console.log("   Linux: sudo apt install ffmpeg");
+    return false;
+  }
+};
+
+// Fixed Ollama connection test with IPv4 forcing
+const testOllamaConnection = async () => {
+  try {
+    console.log("Testing Ollama connection...");
+    
+    const healthResponse = await axios.get(`${OLLAMA_BASE_URL}/api/tags`, {
+      timeout: 5000,
+      family: 4,
+      httpAgent: new http.Agent({
+        family: 4
+      })
+    });
+    
+    console.log("✅ Ollama is running!");
+    
+    const models = healthResponse.data.models || [];
+    console.log("Available models:", models.map(m => m.name));
+    
+    const modelExists = models.some(m => m.name.includes(OLLAMA_MODEL.split(':')[0]));
+    if (!modelExists && models.length > 0) {
+      console.log(`⚠️  Model '${OLLAMA_MODEL}' not found. Available models:`, 
+        models.map(m => m.name));
+      console.log(`Run: ollama pull ${OLLAMA_MODEL}`);
+    } else if (modelExists) {
+      console.log(`✅ Model '${OLLAMA_MODEL}' is available!`);
+    } else if (models.length === 0) {
+      console.log(`⚠️  No models found. Run: ollama pull ${OLLAMA_MODEL}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error("❌ Ollama connection failed:", error.message);
+    
+    if (error.code === 'ECONNREFUSED') {
+      console.log("🔧 Ollama server is not running. Please start it with: ollama serve");
+    } else if (error.code === 'ENOTFOUND') {
+      console.log("🔧 Cannot resolve Ollama host. Check your OLLAMA_BASE_URL setting.");
+    }
+    
+    return false;
+  }
+};
+
+app.get("/", (req, res) => {
+  res.send("Virtual Girlfriend Backend - Ready for Demo! 🚀");
+});
+
+app.get("/voices", async (req, res) => {
+  try {
+    if (!elevenLabsApiKey) {
+      res.json({ error: "ElevenLabs API key not set" });
+      return;
+    }
+    const voices = await voice.getVoices(elevenLabsApiKey);
+    res.send(voices);
+  } catch (error) {
+    console.error("Error getting voices:", error);
+    res.status(500).json({ error: "Failed to get voices" });
+  }
+});
+
+app.get("/test-ollama", async (req, res) => {
+  try {
+    const isConnected = await testOllamaConnection();
+    if (!isConnected) {
+      throw new Error("Cannot connect to Ollama server");
+    }
+    
+    const response = await callOllama("Hello, how are you?");
+    res.json({ success: true, response, connection: "OK" });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      connection: "FAILED"
+    });
+  }
+});
+
+const execCommand = (command) => {
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Command failed: ${command}`);
+        console.error(`Error: ${error.message}`);
+        reject(error);
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
+};
+
+// Simplified lip sync without Rhubarb dependency
+const createSimpleLipSync = async (message, duration = 2.0) => {
+  const lipSyncData = {
+    metadata: { duration },
+    mouthCues: [
+      { start: 0.0, end: duration * 0.3, value: "A" },
+      { start: duration * 0.3, end: duration * 0.6, value: "E" },
+      { start: duration * 0.6, end: duration, value: "O" }
+    ]
+  };
+  
+  try {
+    await fs.writeFile(`audios/message_${message}.json`, JSON.stringify(lipSyncData));
+    console.log(`✅ Simple lip sync created for message ${message}`);
+  } catch (error) {
+    console.error(`❌ Error creating lip sync for message ${message}:`, error);
+  }
+};
+
+const lipSyncMessage = async (message) => {
+  const time = new Date().getTime();
+  console.log(`Starting conversion for message ${message}`);
+  
+  try {
+    // Check if input file exists
+    const inputFile = `audios/message_${message}.mp3`;
+    await fs.access(inputFile);
+    
+    // Convert MP3 to WAV
+    await execCommand(
+      `ffmpeg -y -i audios/message_${message}.mp3 audios/message_${message}.wav`
+    );
+    console.log(`Conversion done in ${new Date().getTime() - time}ms`);
+    
+    // Try Rhubarb lip sync, fallback to simple version
+    try {
+      await execCommand(
+        `bin/rhubarb.exe -f json -o audios/message_${message}.json audios/message_${message}.wav -r phonetic`
+      );
+      console.log(`Rhubarb lip sync done in ${new Date().getTime() - time}ms`);
+    } catch (rhubarbError) {
+      console.log(`⚠️  Rhubarb not available, using simple lip sync`);
+      await createSimpleLipSync(message, 2.0);
+    }
+    
+  } catch (error) {
+    console.error(`❌ Lip sync error for message ${message}:`, error);
+    // Create fallback lip sync data
+    await createSimpleLipSync(message, 2.0);
+  }
+};
+
+// Enhanced Ollama function with better prompt and error handling
+const callOllama = async (userMessage) => {
+  console.log("🤖 Calling Ollama with message:", userMessage);
+  
+  try {
+    const requestData = {
+      model: OLLAMA_MODEL,
+      prompt: `You are a friendly virtual girlfriend. Respond in JSON format only.
+
+Rules:
+- Maximum 2 messages per response
+- Keep responses short and sweet (under 50 words each)
+- Use appropriate facial expressions and animations
+- Be caring and supportive
+
+Facial expressions: smile, sad, angry, surprised, funnyFace, default
+Animations: Talking_0, Talking_1, Talking_2, Crying, Laughing, Rumba, Idle, Terrified, Angry
+
+User message: ${userMessage}
+
+Respond with this exact JSON structure:
+{
+  "messages": [
+    {
+      "text": "Your sweet response here",
+      "facialExpression": "smile",
+      "animation": "Talking_1"
+    }
+  ]
+}`,
+      stream: false,
+      format: "json"
+    };
+
+    console.log("📤 Sending request to Ollama...");
+    
+    const response = await axios.post(`${OLLAMA_BASE_URL}/api/generate`, requestData, {
+      timeout: 30000, // Reduced timeout
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      family: 4,
+      httpAgent: new http.Agent({
+        family: 4
+      })
+    });
+
+    console.log("📥 Ollama response received");
+    
+    if (!response.data || !response.data.response) {
+      throw new Error("Invalid response format from Ollama");
+    }
+    
+    return response.data.response;
+  } catch (error) {
+    console.error("❌ Ollama API Error:", error.message);
+    
+    if (error.code === 'ECONNREFUSED') {
+      throw new Error("Ollama server is not running. Please start with: ollama serve");
+    } else if (error.response?.status === 404) {
+      throw new Error(`Model '${OLLAMA_MODEL}' not found. Run: ollama pull ${OLLAMA_MODEL}`);
+    } else if (error.code === 'ENOTFOUND') {
+      throw new Error("Cannot connect to Ollama. Check your OLLAMA_BASE_URL setting.");
+    }
+    
+    throw error;
+  }
+};
+
+app.post("/chat", async (req, res) => {
+  const userMessage = req.body.message;
+  console.log("💬 Chat request received:", userMessage);
+  
+  if (!userMessage) {
+    console.log("No message provided, sending intro");
+    res.send({
+      messages: [
+        {
+          text: "Hey sweetheart! How has your day been?",
+          audio: "",
+          lipsync: { metadata: { duration: 2.0 }, mouthCues: [] },
+          facialExpression: "smile",
+          animation: "Talking_1",
+        }
+      ],
+    });
+    return;
+  }
+
+  if (!elevenLabsApiKey) {
+    console.log("ElevenLabs API key missing");
+    res.send({
+      messages: [
+        {
+          text: "I need you to set up the ElevenLabs API key so I can speak to you!",
+          audio: "",
+          lipsync: { metadata: { duration: 2.0 }, mouthCues: [] },
+          facialExpression: "sad",
+          animation: "Talking_0",
+        },
+      ],
+    });
+    return;
+  }
+
+  try {
+    // Call Ollama
+    console.log("🤖 Processing with Ollama...");
+    const ollamaResponse = await callOllama(userMessage);
+    
+    let messages;
+    try {
+      console.log("📝 Parsing Ollama response...");
+      const parsedResponse = JSON.parse(ollamaResponse);
+      messages = parsedResponse.messages || [parsedResponse];
+      console.log("✅ Parsed messages:", messages);
+    } catch (parseError) {
+      console.error("❌ JSON Parse Error:", parseError);
+      console.log("Raw response:", ollamaResponse);
+      
+      // Fallback response
+      messages = [
+        {
+          text: "I'm having trouble thinking right now. Can you say that again?",
+          facialExpression: "confused",
+          animation: "Talking_0"
+        }
+      ];
+    }
+
+    // Ensure messages is an array and limit to 2 messages
+    if (!Array.isArray(messages)) {
+      messages = [messages];
+    }
+    messages = messages.slice(0, 2); // Limit to 2 messages max
+
+    console.log(`🎵 Processing ${messages.length} messages for TTS...`);
+
+    // Process each message
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      console.log(`Processing message ${i}: ${message.text}`);
+      
+      try {
+        // Generate audio file
+        const fileName = `audios/message_${i}.mp3`;
+        const textInput = message.text.replace(/[^\w\s.,!?-]/g, ''); // Clean text for TTS
+        
+        console.log(`🎙️ Generating TTS for: "${textInput}"`);
+        
+        // Use ElevenLabs TTS with proper error handling
+        try {
+          await voice.textToSpeech(elevenLabsApiKey, voiceID, fileName, textInput, {
+            stability: 0.3,
+            similarity_boost: 0.7
+          });
+          
+          // Check if file was created
+          await fs.access(fileName);
+          console.log(`✅ TTS file created: ${fileName}`);
+          
+        } catch (ttsError) {
+          console.error(`❌ TTS Error for message ${i}:`, ttsError.message);
+          // Create a silent audio file as fallback
+          message.audio = "";
+          message.lipsync = { metadata: { duration: 2.0 }, mouthCues: [] };
+          continue;
+        }
+        
+        // Generate lipsync
+        console.log(`👄 Generating lip sync for message ${i}`);
+        await lipSyncMessage(i);
+        
+        // Add audio and lipsync data
+        message.audio = await audioFileToBase64(fileName);
+        message.lipsync = await readJsonTranscript(`audios/message_${i}.json`);
+        
+        console.log(`✅ Message ${i} processed successfully`);
+        
+      } catch (audioError) {
+        console.error(`❌ Audio processing error for message ${i}:`, audioError);
+        message.audio = "";
+        message.lipsync = { metadata: { duration: 2.0 }, mouthCues: [] };
+      }
+    }
+
+    console.log("✅ All messages processed, sending response");
+    res.send({ messages });
+
+  } catch (error) {
+    console.error("❌ Chat endpoint error:", error);
+    res.status(500).send({
+      messages: [
+        {
+          text: "I'm having some technical difficulties. Let me try to fix this!",
+          facialExpression: "sad",
+          animation: "Crying",
+          audio: "",
+          lipsync: { metadata: { duration: 2.0 }, mouthCues: [] }
+        }
+      ]
+    });
+  }
+});
+
+const readJsonTranscript = async (file) => {
+  try {
+    const data = await fs.readFile(file, "utf8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.log(`Warning: Could not read ${file}, using simple lipsync`);
+    return { 
+      metadata: { duration: 2.0 }, 
+      mouthCues: [
+        { start: 0.0, end: 0.7, value: "A" },
+        { start: 0.7, end: 1.3, value: "E" },
+        { start: 1.3, end: 2.0, value: "O" }
+      ] 
+    };
+  }
+};
+
+const audioFileToBase64 = async (file) => {
+  try {
+    const data = await fs.readFile(file);
+    return data.toString("base64");
+  } catch (error) {
+    console.log(`Warning: Could not read audio file ${file}`);
+    return "";
+  }
+};
+
+// Start server with all validations
+const startServer = async () => {
+  console.log("🚀 Starting Virtual Girlfriend Server...");
+  
+  // Ensure required directories exist
+  await ensureDirectories();
+  
+  // Validate all dependencies
+  const elevenLabsValid = await validateElevenLabsKey();
+  const ffmpegAvailable = await checkFFmpeg();
+  const ollamaConnected = await testOllamaConnection();
+  
+  app.listen(port, () => {
+    console.log(`\n🚀 Virtual Girlfriend server running on port ${port}`);
+    console.log(`📡 Test endpoints:`);
+    console.log(`   http://localhost:${port}/`);
+    console.log(`   http://localhost:${port}/test-ollama`);
+    console.log(`   http://localhost:${port}/voices`);
+    
+    console.log(`\n📋 System Status:`);
+    console.log(`   ElevenLabs API: ${elevenLabsValid ? '✅' : '❌'}`);
+    console.log(`   FFmpeg: ${ffmpegAvailable ? '✅' : '⚠️  (Simple lip sync fallback)'}`);
+    console.log(`   Ollama: ${ollamaConnected ? '✅' : '❌'}`);
+    
+    if (!elevenLabsValid) {
+      console.log(`\n🔧 To fix ElevenLabs:`);
+      console.log(`   1. Get a valid API key from https://elevenlabs.io/`);
+      console.log(`   2. Set ELEVEN_LABS_API_KEY in your .env file`);
+    }
+    
+    if (!ollamaConnected) {
+      console.log(`\n🔧 To fix Ollama:`);
+      console.log(`   1. Run: ollama serve`);
+      console.log(`   2. Run: ollama pull ${OLLAMA_MODEL}`);
+    }
+    
+    console.log(`\n🎬 Ready for your demo! 🚀`);
+  });
+};
+
+startServer().catch(console.error);
